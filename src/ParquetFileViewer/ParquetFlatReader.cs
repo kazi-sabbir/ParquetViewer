@@ -1,4 +1,6 @@
-﻿using System;
+﻿using ParquetFileViewer.Utilities;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
@@ -9,9 +11,8 @@ namespace ParquetFileViewer
 {
     public class ParquetFlatReader : IDisposable
     {
-        List<Parquet.ParquetReader> readers = new List<Parquet.ParquetReader>();
-
-        private Parquet.ParquetReader defaultReader { get { return this.readers[0]; } }
+        private Task<long> recordCountTask = null;
+        private List<Parquet.ParquetReader> readers = new List<Parquet.ParquetReader>();
 
         public ParquetFlatReader(string filePath, int degreeOfParallelism = 1, Parquet.ParquetOptions parquetOptions = null)
         {
@@ -21,9 +22,31 @@ namespace ParquetFileViewer
             if (degreeOfParallelism <= 0)
                 throw new ArgumentException("degreeOfParallelism must be a positive integer");
 
+            this.recordCountTask = Task.Run(() =>
+            {
+                using (var benchmark = new SimpleBenchmark("GetRowCountAsync"))
+                {
+                    using (var rowCountReader = new Parquet.ParquetReader(new FileStream(filePath, FileMode.Open, FileAccess.Read),
+                        parquetOptions,
+                        false))
+                    {
+                        long count = 0;
+                        for (int i = 0; i < rowCountReader.RowGroupCount; i++)
+                        {
+                            using (var groupReader = rowCountReader.OpenRowGroupReader(i))
+                            {
+                                count += groupReader.RowCount;
+                            }
+                        }
+
+                        return count;
+                    }
+                }
+            });
+
             for (int i = 0; i < degreeOfParallelism; i++)
             {
-                readers.Add(
+                this.readers.Add(
                     new Parquet.ParquetReader(new FileStream(filePath, FileMode.Open, FileAccess.Read),
                         parquetOptions,
                         false)
@@ -31,88 +54,102 @@ namespace ParquetFileViewer
             }
         }
 
-
-
-        public long GetRowCount()
+        public Task<long> GetRowCount()
         {
-            long count = 0;
-            for (int i = 0; i < this.defaultReader.RowGroupCount; i++)
-            {
-                using (var groupReader = this.defaultReader.OpenRowGroupReader(i))
-                {
-                    count += groupReader.RowCount;
-                }
-            }
-
-            return count;
+            return this.recordCountTask;
         }
 
-        public DataTable ToDataTable(List<string> selectedFields, long offset, long recordCount)
+        public async Task<DataTable> ToDataTable(List<string> selectedFields, long offset, long recordCount)
         {
-            //Get list of data fields and construct the DataTable
-            DataTable dataTable = new DataTable();
-            List<Parquet.Data.DataField> fields = new List<Parquet.Data.DataField>();
-            var dataFields = this.defaultReader.Schema.GetDataFields();
-            foreach (string selectedField in selectedFields)
+            using (var benchmark = new SimpleBenchmark("ToDataTable"))
             {
-                var dataField = dataFields.FirstOrDefault(f => f.Name.Equals(selectedField, StringComparison.InvariantCultureIgnoreCase));
-                if (dataField != null)
+                int concurrency = Math.Min(this.readers.Count, selectedFields.Count);
+                int fieldsPerThread = selectedFields.Count / concurrency;
+
+                int threadIndex = 0;
+                var tasks = new List<Task<DataTable>>();
+                foreach (List<string> fields in UtilityMethods.SplitList(selectedFields, fieldsPerThread))
                 {
-                    fields.Add(dataField);
-                    DataColumn newColumn = new DataColumn(dataField.Name, ParquetNetTypeToCSharpType(dataField.DataType));
-                    dataTable.Columns.Add(newColumn);
+                    tasks.Add(this.ToDataTableInternal(this.readers[threadIndex], fields, offset, recordCount));
+                    threadIndex++;
                 }
-                else
-                    throw new Exception(string.Format("Field '{0}' does not exist", selectedField));
+
+                DataTable finalResult = new DataTable();
+                while (tasks.Count > 0)
+                {
+                    var completedTask = await Task.WhenAny(tasks);
+                    finalResult = UtilityMethods.MergeTablesByIndex(finalResult, completedTask.Result);
+                    tasks.Remove(completedTask);
+                }
+
+                return finalResult; //TODO: Test column order with large file
+                                    //return finalResult.SetColumnsOrder(selectedFields);
             }
+        }
 
-            long totalRecordCount = 0;
-
-            //Read column by column to generate each row in the datatable
-            for (int i = 0; i < this.defaultReader.RowGroupCount; i++)
+        private async Task<DataTable> ToDataTableInternal(Parquet.ParquetReader reader, List<string> selectedFields, long offset, long recordCount)
+        {
+            using (var benchmark = new SimpleBenchmark("ToDataTableInternal"))
             {
-                bool readGroup = false;
-                long rowsLeftToRead = recordCount;
-                long rowsPassedUntilThisRowGroup = -1;
-                long groupRowCount = -1;
-                using (var groupReader = this.defaultReader.OpenRowGroupReader(i))
+                //Get list of data fields and construct the DataTable
+                DataTable dataTable = new DataTable();
+                List<Parquet.Data.DataField> fields = new List<Parquet.Data.DataField>();
+                var dataFields = reader.Schema.GetDataFields();
+                foreach (string selectedField in selectedFields)
                 {
-                    rowsPassedUntilThisRowGroup = totalRecordCount;
-                    totalRecordCount += (int)groupReader.RowCount;
-
-                    if (offset >= totalRecordCount)
-                        continue;
-
-                    if (rowsLeftToRead > 0)
-                        readGroup = true;
-
-                    groupRowCount = groupReader.RowCount;
+                    var dataField = dataFields.FirstOrDefault(f => f.Name.Equals(selectedField, StringComparison.InvariantCultureIgnoreCase));
+                    if (dataField != null)
+                    {
+                        fields.Add(dataField);
+                        DataColumn newColumn = new DataColumn(dataField.Name, ParquetNetTypeToCSharpType(dataField.DataType));
+                        dataTable.Columns.Add(newColumn);
+                    }
+                    else
+                        throw new Exception(string.Format("Field '{0}' does not exist", selectedField));
                 }
 
-                if (readGroup)
+                long totalRecordCount = 0;
+                long rowsLeftToRead = recordCount;
+
+                //Read column by column to generate each row in the datatable
+                for (int i = 0; i < reader.RowGroupCount; i++)
                 {
-                    //TODO:Split fields by degree of parallelism
+                    bool readGroup = false;
 
-                    long numberOfRecordsToReadFromThisRowGroup = Math.Min(Math.Min(totalRecordCount - offset, recordCount), groupRowCount);
-                    rowsLeftToRead -= numberOfRecordsToReadFromThisRowGroup;
-
-                    long recordsToSkipInThisRowGroup = Math.Max(offset - rowsPassedUntilThisRowGroup, 0);
-
-                    List<Task> readOperations = new List<Task>();
-                    foreach (var reader in this.readers)
+                    long rowsPassedUntilThisRowGroup = -1;
+                    long groupRowCount = -1;
+                    using (var groupReader = reader.OpenRowGroupReader(i))
                     {
-                        readOperations.Add(Task.Run(() =>
+                        rowsPassedUntilThisRowGroup = totalRecordCount;
+                        totalRecordCount += (int)groupReader.RowCount;
+
+                        if (offset >= totalRecordCount)
+                            continue;
+
+                        if (rowsLeftToRead > 0)
+                            readGroup = true;
+                        else
+                            break;
+
+                        groupRowCount = groupReader.RowCount;
+
+                        if (readGroup)
                         {
-                            using (var groupReader = reader.OpenRowGroupReader(i))
+                            long numberOfRecordsToReadFromThisRowGroup = Math.Min(Math.Min(totalRecordCount - offset, rowsLeftToRead), groupRowCount);
+                            rowsLeftToRead -= numberOfRecordsToReadFromThisRowGroup;
+
+                            long recordsToSkipInThisRowGroup = Math.Max(offset - rowsPassedUntilThisRowGroup, 0);
+
+                            await Task.Run(() =>
                             {
                                 ProcessRowGroup(dataTable, groupReader, fields, recordsToSkipInThisRowGroup, numberOfRecordsToReadFromThisRowGroup);
-                            }
-                        }));
+                            });
+                        }
                     }
                 }
-            }
 
-            return dataTable;
+                return dataTable;
+            }
         }
 
         private static void ProcessRowGroup(DataTable dataTable, Parquet.ParquetRowGroupReader groupReader, List<Parquet.Data.DataField> fields, long skipRecords, long readRecords)
@@ -133,7 +170,7 @@ namespace ParquetFileViewer
                         continue;
                     }
 
-                    if (rowIndex >= readRecords)
+                    if (rowIndex - rowBeginIndex >= readRecords)
                         break;
 
                     if (isFirstColumn)
@@ -145,7 +182,7 @@ namespace ParquetFileViewer
                     if (value == null)
                         dataTable.Rows[rowIndex][field.Name] = DBNull.Value;
                     else if (field.DataType == Parquet.Data.DataType.DateTimeOffset)
-                        dataTable.Rows[rowIndex][field.Name] = ((DateTimeOffset)value).DateTime; //converts to local time!
+                        dataTable.Rows[rowIndex][field.Name] = ((DateTimeOffset)value).DateTime;
                     else
                         dataTable.Rows[rowIndex][field.Name] = value;
 
@@ -158,6 +195,7 @@ namespace ParquetFileViewer
 
         public static Type ParquetNetTypeToCSharpType(Parquet.Data.DataType type)
         {
+            //TODO: Create static readonly Dictionary<Parquet.Data.DataType, Type>?
             Type columnType = null;
             switch (type)
             {

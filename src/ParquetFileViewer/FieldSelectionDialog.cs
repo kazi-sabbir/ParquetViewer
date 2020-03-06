@@ -1,5 +1,5 @@
-﻿using System;
-using System.Collections;
+﻿using Parquet.Data;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -11,21 +11,22 @@ namespace ParquetFileViewer
     {
         private const string SelectAllCheckboxName = "checkbox_selectallfields";
         private const int DynamicFieldCheckboxYIncrement = 30;
+        private bool stopSelectAllEvent = false;
 
         public IEnumerable<string> PreSelectedFields { get; set; }
-        public IEnumerable<string> AvailableFields { get; set; }
+        public IEnumerable<Field> AvailableFields { get; set; }
 
         public List<string> NewSelectedFields { get; set; }
 
         public FieldsToLoadForm()
         {
             InitializeComponent();
-            this.AvailableFields = new List<string>();
+            this.AvailableFields = new List<Field>();
             this.PreSelectedFields = new List<string>();
             this.NewSelectedFields = new List<string>();
         }
 
-        public FieldsToLoadForm(IEnumerable<string> availableFields, IEnumerable<string> preSelectedFields)
+        public FieldsToLoadForm(IEnumerable<Field> availableFields, IEnumerable<string> preSelectedFields)
         {
             InitializeComponent();
             this.AvailableFields = availableFields;
@@ -46,9 +47,10 @@ namespace ParquetFileViewer
                     int locationX = 0;
                     int locationY = 5;
                     bool isFirst = true;
-                    Hashtable fieldNames = new Hashtable();
+                    HashSet<string> fieldNames = new HashSet<string>();
+                    CheckBox selectAllCheckbox = null;
 
-                    foreach (string field in this.AvailableFields)
+                    foreach (Field field in this.AvailableFields)
                     {
                         if (isFirst) //Add toggle all checkbox and some other setting changes
                         {
@@ -63,7 +65,7 @@ namespace ParquetFileViewer
                                 }
                             }
 
-                            var selectAllCheckbox = new CheckBox()
+                            selectAllCheckbox = new CheckBox()
                             {
                                 Name = SelectAllCheckboxName,
                                 Text = "Select All",
@@ -75,12 +77,19 @@ namespace ParquetFileViewer
 
                             selectAllCheckbox.CheckedChanged += (object checkboxSender, EventArgs checkboxEventArgs) =>
                             {
+                                if (this.stopSelectAllEvent)
+                                {
+                                    this.stopSelectAllEvent = false;
+                                    return;
+                                }
+
                                 var selectAllCheckBox = (CheckBox)checkboxSender;
                                 foreach (Control control in this.fieldsPanel.Controls)
                                 {
-                                    if (!control.Tag.Equals(SelectAllCheckboxName) && control is CheckBox)
+                                    if (!control.Tag.Equals(SelectAllCheckboxName) && control is CheckBox checkbox)
                                     {
-                                        ((CheckBox)control).Checked = selectAllCheckBox.Checked;
+                                        if (checkbox.Enabled)
+                                            checkbox.Checked = selectAllCheckBox.Checked;
                                     }
                                 }
                             };
@@ -89,21 +98,34 @@ namespace ParquetFileViewer
                             locationY += DynamicFieldCheckboxYIncrement;
                         }
 
-                        if (!fieldNames.ContainsKey(field)) //Normally two fields with the same name shouldn't exist but lets make sure
+                        if (!fieldNames.Contains(field.Name.ToLowerInvariant())) //Normally two fields with the same name shouldn't exist but lets make sure
                         {
-                            this.fieldsPanel.Controls.Add(
-                                new CheckBox()
+                            bool isUnsupportedFieldType = field.SchemaType == SchemaType.List || field.SchemaType == SchemaType.Map || field.SchemaType == SchemaType.Struct;
+
+                            var checkbox = new CheckBox()
+                            {
+                                Name = string.Concat("checkbox_", field.Name),
+                                Text = string.Concat(field.Name, isUnsupportedFieldType ? "(Unsupported)" : string.Empty),
+                                Tag = field.Name,
+                                Checked = this.PreSelectedFields.Contains(field.Name),
+                                Location = new Point(locationX, locationY),
+                                AutoSize = true,
+                                Enabled = !isUnsupportedFieldType
+                            };
+
+                            checkbox.CheckedChanged += (object checkboxSender, EventArgs checkboxEventArgs) =>
+                            {
+                                if (!((CheckBox)checkboxSender).Checked && selectAllCheckbox?.Checked == true)
                                 {
-                                    Name = string.Concat("checkbox_", field),
-                                    Text = field,
-                                    Tag = field,
-                                    Checked = this.PreSelectedFields.Contains(field),
-                                    Location = new Point(locationX, locationY),
-                                    AutoSize = true
-                                });
+                                    this.stopSelectAllEvent = true;
+                                    selectAllCheckbox.Checked = false;
+                                }
+                            };
+
+                            this.fieldsPanel.Controls.Add(checkbox);
 
                             locationY += DynamicFieldCheckboxYIncrement;
-                            fieldNames.Add(field, field);
+                            fieldNames.Add(field.Name.ToLowerInvariant());
                         }
                     }
                 }
@@ -149,7 +171,7 @@ namespace ParquetFileViewer
                 {
                     foreach(Control control in this.fieldsPanel.Controls)
                     {
-                        if (!control.Name.Equals(SelectAllCheckboxName))
+                        if (!control.Name.Equals(SelectAllCheckboxName) && control.Enabled)
                             this.NewSelectedFields.Add((string)control.Tag);
                     }
                 }
@@ -157,7 +179,7 @@ namespace ParquetFileViewer
                 {
                     foreach (Control control in this.fieldsPanel.Controls)
                     {
-                        if (control is CheckBox && ((CheckBox)control).Checked && !control.Name.Equals(SelectAllCheckboxName))
+                        if (control is CheckBox checkbox && checkbox.Checked && !checkbox.Name.Equals(SelectAllCheckboxName) && checkbox.Enabled)
                             this.NewSelectedFields.Add((string)control.Tag);
                     }
 
@@ -168,7 +190,7 @@ namespace ParquetFileViewer
                     }
                 }
 
-                this.DialogResult = System.Windows.Forms.DialogResult.OK;
+                this.DialogResult = DialogResult.OK;
                 this.Close();
             }
             catch(Exception ex)
